@@ -225,10 +225,28 @@ namespace AndroidPermissionGranter
             catch (Exception ex) { return "[ОШИБКА] " + ex.Message; }
         }
 
+        /// <summary>
+        /// Прогрев shell-канала перед "тяжёлыми" командами (как `timeout 5 adb shell echo ok`
+        /// в grant_permissions.sh). На некоторых ГУ shell-сервис холодный — без этого
+        /// первая команда зависает.
+        /// </summary>
+        public static async Task<bool> WarmupShellAsync()
+        {
+            try { var r = await RunAsync("shell echo ok", 5); return r != null && r.IndexOf("ok", StringComparison.OrdinalIgnoreCase) >= 0; }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Как в скрипте: если команда не вернула вывод (включая случай таймаута) — это НЕ
+        /// фатальная ошибка, просто пустой список. Решение, пробовать ли без `-3`, принимает
+        /// вызывающий код. Таймаут поднят до 30 с — на ГУ `pm list` бывает медленным.
+        /// </summary>
         public static async Task<List<string>> GetPackagesAsync(bool thirdOnly = true)
         {
             var cmd = thirdOnly ? "shell pm list packages -3" : "shell pm list packages";
-            var res = await RunAsync(cmd, 20);
+            string res;
+            try { res = await RunAsync(cmd, 30); }
+            catch (TimeoutException) { return new List<string>(); }
 
             var list = new List<string>();
             if (string.IsNullOrWhiteSpace(res)) return list;
@@ -805,17 +823,36 @@ namespace AndroidPermissionGranter
         private async Task LoadPkgsAsync()
         {
             SetBusy(true);
-            _statusLabel.Text = "Загрузка списка приложений…";
             _pkgList.Items.Clear();
             _permList.Items.Clear();
             _packages.Clear();
 
             try
             {
+                // Прогрев shell — как в скрипте: `timeout 5 adb shell echo ok`.
+                // На холодных ГУ первая shell-команда без прогрева может зависать.
+                _statusLabel.Text = "Проверка устройства…";
+                Log("Проверка отклика устройства…", LogDim);
+                if (!await AdbHelper.WarmupShellAsync())
+                {
+                    Log("Устройство не отвечает на adb shell. Проверьте подключение.", LogErr);
+                    _statusLabel.Text = "Устройство не отвечает";
+                    _statusLabel.ForeColor = Theme.Danger;
+                    return;
+                }
+                Log("Устройство готово.", LogOk);
+
+                // 1) Пробуем сторонние приложения. Если пусто (включая случай таймаута) —
+                //    идём дальше, как делает скрипт.
+                _statusLabel.Text = "Загрузка списка приложений (pm list -3)…";
+                Log("Запрос списка сторонних приложений…", LogDim);
                 _packages = await AdbHelper.GetPackagesAsync(true);
+
                 if (_packages.Count == 0)
                 {
-                    Log("Сторонние приложения не найдены, загружаю полный список…", LogWarn);
+                    // 2) Fallback — полный список (точно как `if [ ! -s "$TMP_LIST" ]` в скрипте).
+                    _statusLabel.Text = "Загрузка полного списка приложений (pm list)…";
+                    Log("Сторонние приложения не найдены или команда не ответила, пробую полный список…", LogWarn);
                     _packages = await AdbHelper.GetPackagesAsync(false);
                 }
 
@@ -826,7 +863,7 @@ namespace AndroidPermissionGranter
                 _statusLabel.ForeColor = _packages.Count > 0 ? Theme.Success : Theme.Danger;
                 Log(_packages.Count > 0
                         ? "Найдено приложений: " + _packages.Count
-                        : "Список пуст. Проверьте подключение устройства.",
+                        : "Список пуст. На устройстве `pm list packages` не возвращает результат.",
                     _packages.Count > 0 ? LogOk : LogWarn);
             }
             catch (Exception ex)
