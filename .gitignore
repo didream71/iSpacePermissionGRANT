@@ -1,0 +1,16 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+
+# Signing key — private, must never be published
+*.pfx
+
+# ClickOnce / publish
+[Pp]ublish/
+*.publishproj
