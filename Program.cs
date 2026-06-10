@@ -153,10 +153,20 @@ namespace AndroidPermissionGranter
 
         /// <summary>
         /// Запуск adb с тайм-аутом БЕЗ зависаний.
-        /// Ключевой момент: оба потока (stdout/stderr) читаются асинхронно СРАЗУ после старта.
-        /// Если читать их только после выхода процесса (как было раньше), буфер канала (~4 КБ)
-        /// переполняется на большом выводе (dumpsys), adb блокируется на записи, событие Exited
-        /// не наступает — и приложение зависает до тайм-аута. Теперь дедлок исключён.
+        ///
+        /// Два важных момента:
+        ///
+        /// 1. Оба потока (stdout/stderr) читаются асинхронно СРАЗУ после старта — иначе
+        ///    буфер пайпа (~4 КБ) переполняется на больших выводах (`dumpsys`),
+        ///    adb блокируется на записи и не завершается.
+        ///
+        /// 2. На некоторых ГУ команды `pm list packages` / `dumpsys package`
+        ///    **никогда не завершают сессию шелл-адба** — `adb` остаётся висеть, даже
+        ///    выдав весь полезный вывод. Скрипт `grant_permissions.sh` решает это
+        ///    так: `timeout 15 adb shell ... > file 2>/dev/null` убивает adb по
+        ///    тайм-ауту, а затем читает то, что уже успело попасть в файл. Мы
+        ///    делаем то же самое: при таймауте убиваем процесс и возвращаем уже
+        ///    накопленный stdout/stderr вместо TimeoutException.
         /// </summary>
         public static async Task<string> RunAsync(string args, int timeoutSec = 10)
         {
@@ -178,20 +188,60 @@ namespace AndroidPermissionGranter
             {
                 proc.Start();
 
-                // Начинаем вычитывать оба потока немедленно — это и предотвращает дедлок.
-                var outTask = proc.StandardOutput.ReadToEndAsync();
-                var errTask = proc.StandardError.ReadToEndAsync();
-                var exitTask = WaitForExitAsync(proc);
+                // Накопительные буферы: пишем в них всё, что прилетает в stdout/stderr,
+                // — чтобы при таймауте всё, что adb успел плюнуть до момента kill, было
+                // у нас в руках. Эквивалент `> file` в bash из скрипта.
+                var outBuf = new StringBuilder();
+                var errBuf = new StringBuilder();
+                var outDone = new TaskCompletionSource<bool>();
+                var errDone = new TaskCompletionSource<bool>();
 
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        char[] buf = new char[4096];
+                        int n;
+                        while ((n = await proc.StandardOutput.ReadAsync(buf, 0, buf.Length)) > 0)
+                            lock (outBuf) outBuf.Append(buf, 0, n);
+                    }
+                    catch { }
+                    finally { outDone.TrySetResult(true); }
+                });
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        char[] buf = new char[4096];
+                        int n;
+                        while ((n = await proc.StandardError.ReadAsync(buf, 0, buf.Length)) > 0)
+                            lock (errBuf) errBuf.Append(buf, 0, n);
+                    }
+                    catch { }
+                    finally { errDone.TrySetResult(true); }
+                });
+
+                var exitTask = WaitForExitAsync(proc);
                 var finished = await Task.WhenAny(exitTask, Task.Delay(timeoutSec * 1000));
-                if (finished != exitTask)
+                bool timedOut = finished != exitTask;
+
+                if (timedOut)
                 {
                     try { if (!proc.HasExited) proc.Kill(); } catch { }
-                    throw new TimeoutException($"Команда ADB не ответила за {timeoutSec} с: adb {args}");
                 }
 
-                string outText = await outTask;
-                string errText = await errTask;
+                // В обоих случаях ждём, пока потоки дочитаются (после Kill ReadAsync
+                // вернётся, потому что пайпы закроются).
+                await Task.WhenAll(outDone.Task, errDone.Task);
+
+                string outText, errText;
+                lock (outBuf) outText = outBuf.ToString();
+                lock (errBuf) errText = errBuf.ToString();
+
+                // Если был таймаут, НО мы что-то уже прочитали — это успех «по-скриптовому».
+                // Полный пустой ответ при таймауте — действительно ошибка.
+                if (timedOut && string.IsNullOrWhiteSpace(outText) && string.IsNullOrWhiteSpace(errText))
+                    throw new TimeoutException($"Команда ADB не ответила за {timeoutSec} с: adb {args}");
 
                 if (string.IsNullOrWhiteSpace(errText)) return outText ?? string.Empty;
                 if (string.IsNullOrWhiteSpace(outText)) return errText;
@@ -245,7 +295,10 @@ namespace AndroidPermissionGranter
         {
             var cmd = thirdOnly ? "shell pm list packages -3" : "shell pm list packages";
             string res;
-            try { res = await RunAsync(cmd, 30); }
+            // 15 с — как `LIST_TIMEOUT` в grant_permissions.sh. На ГУ команда может не
+            // завершиться сама, но за это время успевает напечатать весь список,
+            // и наш RunAsync вернёт уже накопленные данные.
+            try { res = await RunAsync(cmd, 15); }
             catch (TimeoutException) { return new List<string>(); }
 
             var list = new List<string>();
@@ -767,6 +820,7 @@ namespace AndroidPermissionGranter
             if (string.IsNullOrWhiteSpace(ipInput)) return;
             await ConnectToAddressAsync(ipInput.Trim());
         }
+
 
 
         private async Task ConnectToAddressAsync(string address)
